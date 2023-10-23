@@ -97,12 +97,6 @@ typedef struct BufferAccessStrategyData
 }			BufferAccessStrategyData;
 
 
-/* Prototypes for internal functions */
-static BufferDesc *GetBufferFromRing(BufferAccessStrategy strategy,
-									 uint32 *buf_state);
-static void AddBufferToRing(BufferAccessStrategy strategy,
-							BufferDesc *buf);
-
 /*
  * ClockSweepTick - Helper routine for StrategyGetBuffer()
  *
@@ -202,7 +196,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 {
 	BufferDesc *buf;
 	int			bgwprocno;
-	int			trycounter;
+	//int			trycounter;
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
 
 
@@ -259,11 +253,26 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 	/* Nothing on the freelist, so run the LRU algorithm */
 	for (;;)
 	{
+		/* Acquire the spinlock to remove element from the freelist */
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+
+		if (StrategyControl->firstFreeBuffer < 0)
+		{
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+			break;
+		}
+
 		buf = GetBufferDescriptor(StrategyControl->firstFreeBuffer);
 		Assert(buf->freeNext != FREENEXT_NOT_IN_LIST);
 
 		StrategyControl->firstFreeBuffer = buf->freeNext;
 		buf->freeNext = FREENEXT_NOT_IN_LIST;
+
+		/*
+		* Release the lock so someone else can access the freelist while
+		* we check out this buffer.
+		*/
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 
 		/*
 		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
@@ -523,76 +532,6 @@ FreeAccessStrategy(BufferAccessStrategy strategy)
 	/* don't crash if called on a "default" strategy */
 	if (strategy != NULL)
 		pfree(strategy);
-}
-
-/*
- * GetBufferFromRing -- returns a buffer from the ring, or NULL if the
- *		ring is empty.
- *
- * The bufhdr spin lock is held on the returned buffer.
- */
-static BufferDesc *
-GetBufferFromRing(BufferAccessStrategy strategy, uint32 *buf_state)
-{
-	BufferDesc *buf;
-	Buffer		bufnum;
-	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
-
-
-	/* Advance to next ring slot */
-	if (++strategy->current >= strategy->ring_size)
-		strategy->current = 0;
-
-	/*
-	 * If the slot hasn't been filled yet, tell the caller to allocate a new
-	 * buffer with the normal allocation strategy.  He will then fill this
-	 * slot by calling AddBufferToRing with the new buffer.
-	 */
-	bufnum = strategy->buffers[strategy->current];
-	if (bufnum == InvalidBuffer)
-	{
-		strategy->current_was_in_ring = false;
-		return NULL;
-	}
-
-	/*
-	 * If the buffer is pinned we cannot use it under any circumstances.
-	 *
-	 * If usage_count is 0 or 1 then the buffer is fair game (we expect 1,
-	 * since our own previous usage of the ring element would have left it
-	 * there, but it might've been decremented by clock sweep since then). A
-	 * higher usage_count indicates someone else has touched the buffer, so we
-	 * shouldn't re-use it.
-	 */
-	buf = GetBufferDescriptor(bufnum - 1);
-	local_buf_state = LockBufHdr(buf);
-	if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
-		&& BUF_STATE_GET_USAGECOUNT(local_buf_state) <= 1)
-	{
-		strategy->current_was_in_ring = true;
-		*buf_state = local_buf_state;
-		return buf;
-	}
-	UnlockBufHdr(buf, local_buf_state);
-
-	/*
-	 * Tell caller to allocate a new buffer with the normal allocation
-	 * strategy.  He'll then replace this ring element via AddBufferToRing.
-	 */
-	strategy->current_was_in_ring = false;
-	return NULL;
-}
-
-/*
- * AddBufferToRing -- add a buffer to the buffer ring
- *
- * Caller must hold the buffer header spinlock on the buffer.  Since this
- * is called with the spinlock held, it had better be quite cheap.
- */
-static void
-AddBufferToRing(BufferAccessStrategy strategy, BufferDesc *buf)
-{
-	strategy->buffers[strategy->current] = BufferDescriptorGetBuffer(buf);
 }
 
 /*
